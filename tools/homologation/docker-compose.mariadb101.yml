@@ -1,0 +1,23 @@
+services:
+  mariadb101:
+    image: mariadb:10.1.48
+    environment:
+      MYSQL_DATABASE: acop_hml_mariadb101
+      MYSQL_USER: acop_hml
+      MYSQL_PASSWORD: synthetic-only-change-me
+      MYSQL_ROOT_PASSWORD: synthetic-root-only-change-me
+    ports:
+      - "127.0.0.1:33101:3306"
+    tmpfs:
+      - /var/lib/mysql
+    networks:
+      - acop_hml_isolated
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-psynthetic-root-only-change-me"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+networks:
+  acop_hml_isolated:
+    internal: true

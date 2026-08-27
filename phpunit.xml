@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+>
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        <env name="CACHE_STORE" value="array"/>
+        <env name="DB_CONNECTION" value="sqlite" force="true"/>
+        <env name="DB_DATABASE" value=":memory:" force="true"/>
+        <!--
+            O prefixo precisa ser o mesmo de produção (`avt_`). Com prefixo
+            vazio, a suíte rápida não exercita o caminho em que o alias de tabela
+            também é prefixado, e trechos de SQL cru que referenciam o alias sem
+            tradução passam silenciosamente — foi assim que
+            `ReconciliationAllocationQuery` chegou à Fase 6 com um alias
+            inválido, quebrando a confirmação de match em qualquer banco com
+            prefixo.
+
+            Atenção: um verde em SQLite continua NÃO provando que uma coluna
+            existe. O SQLite reinterpreta identificador desconhecido entre aspas
+            duplas como literal string, então `sum("coluna_inexistente")` devolve
+            0 em vez de erro. Só a suíte MariaDB (`phpunit.mariadb.xml`) prova
+            schema.
+        -->
+        <env name="DB_PREFIX" value="avt_" force="true"/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="PULSE_ENABLED" value="false"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+        <!--
+            Flags e allowlists forçadas para o estado neutro. Sem isto, ligar a
+            conciliação v2 no `.env` local (necessário para demonstrar o sistema)
+            vaza para a suíte e altera resultados de testes de permissão: o gate
+            `reconciliation:view` soma view_user_ids + manage_user_ids, então um
+            `.env` com `RECONCILIATION_V2_MANAGE_USER_IDS=1` faz um teste que
+            espera 403 receber 200. Cada teste habilita o que precisa via
+            `config([...])`.
+        -->
+        <env name="RECONCILIATION_V2_ENABLED" value="false" force="true"/>
+        <env name="RECONCILIATION_MATCHING_ENABLED" value="false" force="true"/>
+        <env name="RECONCILIATION_CLOSING_ENABLED" value="false" force="true"/>
+        <env name="RECONCILIATION_V2_VIEW_USER_IDS" value="" force="true"/>
+        <env name="RECONCILIATION_V2_MANAGE_USER_IDS" value="" force="true"/>
+        <env name="RECONCILIATION_CLOSE_USER_IDS" value="" force="true"/>
+        <env name="RECONCILIATION_REOPEN_USER_IDS" value="" force="true"/>
+        <env name="RECONCILIATION_EXPORT_USER_IDS" value="" force="true"/>
+        <env name="RECONCILIATION_ADMIN_USER_IDS" value="" force="true"/>
+    </php>
+</phpunit>
