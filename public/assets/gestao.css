@@ -149,3 +149,14 @@ tbody tr:hover{background:#f9fbff}
 /* Saldo com que o dia fechou: a última linha de cada data. É a âncora para
    conferir a conciliação contra a planilha do banco, que é lida dia a dia. */
 .saldo-do-dia{background:var(--green-soft);color:var(--green);font-weight:800}
+
+/* Reordenação por arrastar-e-soltar do Movimento do período: a linha inteira
+   é arrastável (não só o ícone), o ícone é só a pista visual. */
+.reorder-row{cursor:grab}
+.reorder-row.dragging{opacity:.4}
+.row-drag-handle{width:22px;padding-left:8px!important;padding-right:0!important;color:#b7bfcc;font-size:12px;letter-spacing:-2px;cursor:grab;user-select:none}
+
+/* Enquanto arrasta: uma borda vermelha no lado pra onde a linha está indo
+   (topo = subindo, embaixo = descendo), pra ficar claro pra onde vai parar. */
+.reorder-row.subindo{box-shadow:inset 0 2px 0 0 var(--red)}
+.reorder-row.descendo{box-shadow:inset 0 -2px 0 0 var(--red)}

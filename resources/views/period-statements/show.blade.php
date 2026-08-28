@@ -9,6 +9,10 @@
     $brlSinal = fn (int $cents) => ($cents < 0 ? '-' : '').'R$ '.number_format((float) Money::fromCents(abs($cents)), 2, ',', '.');
     $diaAnterior = $statement->period_start->copy()->subDay();
     $aberta = $statement->isOpen();
+    // Só quem pode gerenciar a conciliação arrasta linha — igual à regra de
+    // exclusão logo abaixo, e conciliação fechada não reordena mais do que
+    // atualiza.
+    $podeReordenar = $aberta && \Illuminate\Support\Facades\Gate::allows('reconciliation:manage');
 
     // As duas seções vivem na mesma tabela do banco, separadas por `section`:
     // o movimento tem saldo corrido, a pendência não é movimento nenhum.
@@ -145,7 +149,12 @@
 
 <section class="panel table-panel">
     <div class="table-wrap">
-        <table>
+        {{--
+            `data-reorder-url` não muda com a linha nem com o dia — é a mesma
+            rota para qualquer dia deste período, só o corpo do POST muda. O
+            JS de arrastar-e-soltar lê daqui em vez de montar a URL na mão.
+        --}}
+        <table @if($podeReordenar) data-reorder-url="{{ route('period-statements.lines.reorder', $statement) }}" @endif>
             <thead>
                 <tr>
                     <th>DATA</th>
@@ -174,7 +183,17 @@
                 </tr>
 
                 @forelse($movimento as $linha)
-                    <tr>
+                    <tr
+                        @if($podeReordenar)
+                            draggable="true"
+                            class="reorder-row"
+                            data-line-id="{{ $linha->id }}"
+                            data-day="{{ $linha->movement_date->toDateString() }}"
+                        @endif
+                    >
+                        @if($podeReordenar)
+                            <td class="row-drag-handle" title="Arrastar para reordenar dentro do mesmo dia {{ $linha->movement_date->format('d/m/Y') }} — a ordem escolhida fica salva">⠿⠿</td>
+                        @endif
                         <td>{{ $linha->movement_date->format('d/m/Y') }}</td>
                         <td>{{ $linha->document_number }}</td>
                         <td>{{ $linha->origin_id }}</td>
@@ -240,5 +259,9 @@
         <a class="button ghost" href="{{ route('period-statements.create', ['account_id' => $statement->account_id]) }}">Nova conciliação</a>
     @endunless
 </div>
+
+@if($podeReordenar)
+    <script src="{{ asset('assets/period-statement-reorder.js') }}" defer></script>
+@endif
 
 @endsection

@@ -50,7 +50,15 @@
                 em duas linhas.
             --}}
             <label>Banco
-                @if($bancos->isEmpty())
+                @if($ehGrupoMesclado)
+                    {{-- Empresa mesclada: as contas bancárias das duas empresas reais entram juntas
+                         na conciliação, então não há um banco só para escolher aqui. --}}
+                    <select disabled>
+                        @foreach($bancos as $b)
+                            <option>{{ $b->fullLabel() }}</option>
+                        @endforeach
+                    </select>
+                @elseif($bancos->isEmpty())
                     <select disabled>
                         <option>— Nenhum banco cadastrado nesta conta —</option>
                     </select>
@@ -140,7 +148,14 @@
             conta bancária nenhuma.
         --}}
         <div style="font-size:15px"><strong>Conta:</strong> {{ $conta?->nome ?: '—' }}</div>
-        <div style="font-size:15px"><strong>Banco:</strong> {{ $banco?->fullLabel() ?: ($conta?->banco ?: '—') }}</div>
+        <div style="font-size:15px">
+            <strong>Banco:</strong>
+            @if($ehGrupoMesclado)
+                {{ $bancos->map->fullLabel()->implode(' + ') ?: '—' }}
+            @else
+                {{ $banco?->fullLabel() ?: ($conta?->banco ?: '—') }}
+            @endif
+        </div>
     </div>
 </section>
 

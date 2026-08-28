@@ -91,6 +91,9 @@ Route::middleware('auth')->group(function (): void {
                 ->middleware('can:reconciliation:manage')->name('lines.exclude');
             Route::post('/{periodStatement}/removidas/{exclusion}/devolver', [PeriodStatementController::class, 'restoreLine'])
                 ->middleware('can:reconciliation:manage')->name('lines.restore');
+            // Reordenar à mão as linhas de um dia (arrastar e soltar).
+            Route::post('/{periodStatement}/linhas/reordenar', [PeriodStatementController::class, 'reorderLines'])
+                ->middleware('can:reconciliation:manage')->name('lines.reorder');
             Route::delete('/{periodStatement}', [PeriodStatementController::class, 'destroy'])
                 ->middleware('can:reconciliation:manage')->name('destroy');
         });

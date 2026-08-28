@@ -3,6 +3,7 @@
 namespace App\Application\Financial;
 
 use App\Contracts\AuditEventRecorder;
+use App\Domain\Financial\CompanyGroup;
 use App\Domain\Financial\Enums\FinancialTitleType;
 use App\Domain\Financial\Enums\ManualMovementDirection;
 use App\Domain\Financial\Enums\PeriodStatementSection;
@@ -172,7 +173,7 @@ class PeriodStatementService
 
             $statement = PeriodStatement::create([
                 'account_id' => $accountId,
-                'account_name' => $conta?->nome ?? ('Conta '.$accountId),
+                'account_name' => CompanyGroup::displayName($accountId) ?? $conta?->nome ?? ('Conta '.$accountId),
                 // Congelado como texto igual ao cabeçalho da planilha
                 // ("Banco Itaú - Agência 6260 - C/C 13377-9"). O id fica ao lado
                 // para a conciliação continuar sabendo qual conta é mesmo depois
@@ -294,25 +295,7 @@ class PeriodStatementService
             ];
 
             if ($novos > 0 || $atualizados > 0 || $removidos > 0) {
-                $ordenados = $this->ordenar(array_values($atuais));
-                [$linhas, $totais] = $this->montarLinhas($ordenados, $statement->opening_balance_cents);
-                $pendentes = $this->linhasPendentes(
-                    $statement->account_id,
-                    $statement->period_end->toDateString(),
-                    $statement->bank_account_id,
-                    count($linhas),
-                );
-
-                $statement->lines()->delete();
-                $this->inserirLinhas($statement, [...$linhas, ...$pendentes]);
-
-                $statement->update([
-                    'closing_balance_cents' => $totais['closing_cents'],
-                    'total_in_cents' => $totais['total_in_cents'],
-                    'total_out_cents' => $totais['total_out_cents'],
-                    'line_count' => count($linhas),
-                    'last_synced_at' => now(),
-                ]);
+                $this->reconstruir($statement, $atuais);
 
                 $this->audit->record(
                     'PERIOD_STATEMENT_REFRESHED',
@@ -346,6 +329,151 @@ class PeriodStatementService
                 atualizados: $atualizados,
                 removidos: $removidos,
             );
+        });
+    }
+
+    /**
+     * Reconstrói o MOVIMENTO da conciliação a partir do que está elegível
+     * agora: ordena (respeitando posição manual, se houver), calcula saldo
+     * corrido, regrava pendências e persiste. Único caminho que apaga e
+     * reinsere `period_statement_lines` — usado por `refresh()` (quando o
+     * diff acusa mudança) e por `reordenarDia()` (sempre), para as duas
+     * situações compartilharem a mesma aritmética de saldo em vez de um
+     * segundo caminho menos testado.
+     *
+     * @param  array<string, array<string, mixed>>  $atuais  saída de `elegiveis()`
+     * @return array{0: list<array<string, mixed>>, 1: array{closing_cents: int, total_in_cents: int, total_out_cents: int}}
+     */
+    private function reconstruir(PeriodStatement $statement, array $atuais): array
+    {
+        $posicoesManuais = $this->posicoesManuaisAtuais($statement);
+
+        $ordenados = $this->ordenar(array_values($atuais), $posicoesManuais);
+        [$linhas, $totais] = $this->montarLinhas($ordenados, $statement->opening_balance_cents, $posicoesManuais);
+        $pendentes = $this->linhasPendentes(
+            $statement->account_id,
+            $statement->period_end->toDateString(),
+            $statement->bank_account_id,
+            count($linhas),
+        );
+
+        $statement->lines()->delete();
+        $this->inserirLinhas($statement, [...$linhas, ...$pendentes]);
+
+        $statement->update([
+            'closing_balance_cents' => $totais['closing_cents'],
+            'total_in_cents' => $totais['total_in_cents'],
+            'total_out_cents' => $totais['total_out_cents'],
+            'line_count' => count($linhas),
+            'last_synced_at' => now(),
+        ]);
+
+        return [$linhas, $totais];
+    }
+
+    /**
+     * As posições manuais em vigor, lidas das linhas ATUAIS antes de
+     * `reconstruir()` apagá-las — é o que permite uma reordenação sobreviver
+     * ao próximo `refresh()` (inclusive o automático a cada 5 minutos): a
+     * linha nova recebe a mesma posição da antiga porque as duas têm a
+     * mesma identidade (`chaveDaLinha()`), não o mesmo id de banco de dados.
+     *
+     * @return array<string, int>
+     */
+    private function posicoesManuaisAtuais(PeriodStatement $statement): array
+    {
+        return $statement->lines()
+            ->where('section', PeriodStatementSection::Ledger->value)
+            ->whereNotNull('manual_position')
+            ->get()
+            ->mapWithKeys(fn (PeriodStatementLine $l): array => [$this->chaveDaLinha($l) => (int) $l->manual_position])
+            ->all();
+    }
+
+    /**
+     * Reordena à mão as linhas de UM dia: o extrato do banco às vezes lista
+     * duas movimentações do mesmo dia numa ordem que o critério padrão
+     * (data + quando foi registrada no Gestão) não reproduz, e a planilha
+     * precisa bater com o extrato exatamente. A posição escolhida fica
+     * gravada por linha e sobrevive a um `refresh()` posterior — ver
+     * `posicoesManuaisAtuais()`.
+     *
+     * `$orderedLineIds` precisa ser EXATAMENTE o conjunto de linhas de
+     * MOVIMENTO daquele dia, sem faltar nem sobrar — meio caminho deixaria a
+     * outra metade numa posição indefinida.
+     *
+     * Só mexe no saldo corrido daquele dia: como o total de entradas e
+     * saídas do dia não muda com a ordem interna, o saldo ao FINAL do dia —
+     * e portanto de todo dia seguinte — continua exatamente igual. Por isso
+     * reordenar não precisa (nem faz sentido) ser um recorte "só aquele
+     * dia": `reconstruir()` já resolve isso sozinho, recalculando tudo com o
+     * mesmo custo de um `refresh()` normal.
+     */
+    public function reordenarDia(
+        PeriodStatement $statement,
+        string $date,
+        array $orderedLineIds,
+        ?int $actorId = null,
+    ): PeriodStatement {
+        return DB::transaction(function () use ($statement, $date, $orderedLineIds, $actorId): PeriodStatement {
+            $statement = PeriodStatement::query()->lockForUpdate()->findOrFail($statement->getKey());
+
+            if (! $statement->isOpen()) {
+                throw new DomainException('Esta conciliação está fechada e não pode ser reordenada.');
+            }
+
+            $linhasDoDia = $statement->lines()
+                ->where('section', PeriodStatementSection::Ledger->value)
+                ->whereDate('movement_date', $date)
+                ->get()
+                ->keyBy('id');
+
+            $idsAtuais = $linhasDoDia->keys()->map(fn ($id): int => (int) $id)->sort()->values()->all();
+            $idsRecebidos = collect($orderedLineIds)->map(fn ($id): int => (int) $id)->sort()->values()->all();
+
+            if ($idsAtuais !== $idsRecebidos) {
+                throw new DomainException(
+                    'A ordem enviada não corresponde às movimentações deste dia. Atualize a página e tente de novo.'
+                );
+            }
+
+            $antes = [
+                'closing_balance_cents' => $statement->closing_balance_cents,
+                'total_in_cents' => $statement->total_in_cents,
+                'total_out_cents' => $statement->total_out_cents,
+            ];
+
+            $posicao = 1;
+            foreach ($orderedLineIds as $id) {
+                $linhasDoDia->get((int) $id)->update(['manual_position' => $posicao++]);
+            }
+
+            $atuais = $this->elegiveis(
+                $statement->account_id,
+                $statement->period_start->toDateString(),
+                $statement->period_end->toDateString(),
+                $statement->bank_account_id,
+                $statement,
+            );
+
+            $this->reconstruir($statement, $atuais);
+
+            $this->audit->record(
+                'PERIOD_STATEMENT_LINES_REORDERED',
+                PeriodStatement::class,
+                $statement->id,
+                $antes,
+                [
+                    'movement_date' => $date,
+                    'line_count' => count($orderedLineIds),
+                    'closing_balance_cents' => $statement->closing_balance_cents,
+                ],
+                null,
+                $actorId,
+                (string) Str::uuid(),
+            );
+
+            return $statement->fresh('lines');
         });
     }
 
@@ -479,14 +607,22 @@ class PeriodStatementService
      */
     public function contarSemContaBancaria(int $accountId, string $from, string $to, ?int $bankAccountId): int
     {
-        if ($this->bancoHerdaSemConta($accountId, $bankAccountId)) {
+        // Num grupo mesclado, cada empresa real deduz a própria conta única
+        // (`bancoHerdaSemConta` nunca roda sobre um id mesclado) — uma pode
+        // estar ambígua e a outra não.
+        $idsComContaAmbigua = array_values(array_filter(
+            CompanyGroup::memberIds($accountId),
+            fn (int $membroId): bool => ! $this->bancoHerdaSemConta($membroId, $bankAccountId),
+        ));
+
+        if ($idsComContaAmbigua === []) {
             return 0;
         }
 
         return DB::table('title_settlements')
             ->join('financial_titles', 'financial_titles.id', '=', 'title_settlements.financial_title_id')
             ->where('title_settlements.status', 'CONFIRMED')
-            ->where('financial_titles.account_id', $accountId)
+            ->whereIn('financial_titles.account_id', $idsComContaAmbigua)
             ->whereNull('financial_titles.deleted_at')
             ->whereNull('title_settlements.bank_account_id')
             ->where('title_settlements.settlement_date', '>=', $from)
@@ -510,11 +646,18 @@ class PeriodStatementService
     ): array {
         $porChave = [];
 
-        foreach ($this->linhasDeLiquidacoes($accountId, $from, $to, $bankAccountId) as $linha) {
-            $porChave['settlement:'.$linha['title_settlement_id']] = $linha;
-        }
-        foreach ($this->linhasDeMovimentosManuais($accountId, $from, $to, $bankAccountId) as $linha) {
-            $porChave['manual:'.$linha['manual_movement_id']] = $linha;
+        // Normalmente um id só. Quando `$accountId` é o id canônico de um
+        // grupo mesclado (ver `CompanyGroup`, hoje só Agrocolitti), busca dos
+        // dois ids reais e mescla — as chaves (`settlement:<id>`/
+        // `manual:<id>`) são globalmente únicas, nunca colidem entre
+        // empresas.
+        foreach (CompanyGroup::memberIds($accountId) as $membroId) {
+            foreach ($this->linhasDeLiquidacoes($membroId, $from, $to, $bankAccountId) as $linha) {
+                $porChave['settlement:'.$linha['title_settlement_id']] = $linha;
+            }
+            foreach ($this->linhasDeMovimentosManuais($membroId, $from, $to, $bankAccountId) as $linha) {
+                $porChave['manual:'.$linha['manual_movement_id']] = $linha;
+            }
         }
 
         // As linhas que alguém marcou como "não passou por esta conta" saem
@@ -692,12 +835,19 @@ class PeriodStatementService
         // Um título em aberto não ocorreu, então não tem banco a apurar. Ele
         // pertence à conta bancária da empresa quando ela só tem uma; com duas
         // ou mais, mostrá-lo em cada conciliação repetiria o mesmo título.
-        if (! $this->bancoHerdaSemConta($accountId, $bankAccountId)) {
+        // Num grupo mesclado, cada empresa real decide isso por si — uma pode
+        // qualificar e a outra não.
+        $idsElegiveis = array_values(array_filter(
+            CompanyGroup::memberIds($accountId),
+            fn (int $membroId): bool => $this->bancoHerdaSemConta($membroId, $bankAccountId),
+        ));
+
+        if ($idsElegiveis === []) {
             return [];
         }
 
         $titulos = DB::table('financial_titles')
-            ->where('account_id', $accountId)
+            ->whereIn('account_id', $idsElegiveis)
             ->whereNull('deleted_at')
             ->whereIn('status', ['OPEN', 'PARTIALLY_SETTLED'])
             ->where(function ($q) use ($to): void {
@@ -742,6 +892,11 @@ class PeriodStatementService
 
             $linhas[] = [
                 'line_number' => ++$numero,
+                // Pendência não é arrastável (não tem identidade estável fora
+                // do `financial_title_id`) — sempre null. Presente mesmo
+                // assim porque `inserirLinhas()` insere linhas de LEDGER e de
+                // PENDING no mesmo lote, e as chaves precisam bater.
+                'manual_position' => null,
                 'section' => PeriodStatementSection::Pending->value,
                 // A coluna é NOT NULL e a linha não tem data própria; o fim do
                 // período é o instante a que a pendência se refere. `section`
@@ -819,7 +974,11 @@ class PeriodStatementService
      * @param  list<array<string, mixed>>  $ordenados
      * @return array{0: list<array<string, mixed>>, 1: array{closing_cents: int, total_in_cents: int, total_out_cents: int}}
      */
-    private function montarLinhas(array $ordenados, int $openingCents): array
+    /**
+     * @param  list<array<string, mixed>>  $ordenados
+     * @param  array<string, int>  $posicoesManuais  chave (`chaveDoArray()`) => posição fixada no dia
+     */
+    private function montarLinhas(array $ordenados, int $openingCents, array $posicoesManuais = []): array
     {
         $saldo = $openingCents;
         $entradas = 0;
@@ -833,6 +992,10 @@ class PeriodStatementService
 
             $linhas[] = [
                 'line_number' => ++$numero,
+                // Recuperada pela identidade real da linha, não pela posição
+                // no array — sobrevive ao rebuild porque `posicoesManuaisAtuais()`
+                // já leu isto das linhas antigas antes de elas serem apagadas.
+                'manual_position' => $posicoesManuais[$this->chaveDoArray($linha)] ?? null,
                 'section' => PeriodStatementSection::Ledger->value,
                 'movement_date' => $linha['movement_date'],
                 'document_number' => $linha['document_number'],
@@ -886,17 +1049,49 @@ class PeriodStatementService
      *     registro — uma sincronização em lote cria várias liquidações no
      *     mesmo segundo.
      *
+     * Quando `$posicoesManuais` traz uma posição fixada para uma linha (ver
+     * `reordenarDia()`), ela passa a decidir a ordem DENTRO do mesmo dia,
+     * antes do critério padrão acima: entre duas linhas fixadas, a posição
+     * decide; uma linha fixada sempre vem antes de uma que não foi tocada;
+     * entre duas sem posição, o critério padrão continua valendo — inclusive
+     * uma linha nova que aparece num dia já reordenado, que cai depois das
+     * fixadas até alguém arrastá-la também.
+     *
      * @param  list<array<string, mixed>>  $linhas
+     * @param  array<string, int>  $posicoesManuais  chave (`chaveDoArray()`) => posição fixada no dia
      * @return list<array<string, mixed>>
      */
-    private function ordenar(array $linhas): array
+    private function ordenar(array $linhas, array $posicoesManuais = []): array
     {
-        usort($linhas, static function (array $a, array $b): int {
-            return [$a['movement_date'], $a['_registrado_em'], $a['_ordem_fonte'], $a['_id']]
-                <=> [$b['movement_date'], $b['_registrado_em'], $b['_ordem_fonte'], $b['_id']];
+        usort($linhas, function (array $a, array $b) use ($posicoesManuais): int {
+            if ($a['movement_date'] !== $b['movement_date']) {
+                return $a['movement_date'] <=> $b['movement_date'];
+            }
+
+            $posicaoA = $posicoesManuais[$this->chaveDoArray($a)] ?? null;
+            $posicaoB = $posicoesManuais[$this->chaveDoArray($b)] ?? null;
+
+            if ($posicaoA !== null || $posicaoB !== null) {
+                return match (true) {
+                    $posicaoA !== null && $posicaoB !== null => $posicaoA <=> $posicaoB,
+                    $posicaoA !== null => -1,
+                    default => 1,
+                };
+            }
+
+            return [$a['_registrado_em'], $a['_ordem_fonte'], $a['_id']]
+                <=> [$b['_registrado_em'], $b['_ordem_fonte'], $b['_id']];
         });
 
         return $linhas;
+    }
+
+    /** A mesma identidade de `chaveDaLinha()`, mas para a linha ainda em array (antes de virar `PeriodStatementLine`). */
+    private function chaveDoArray(array $linha): string
+    {
+        return $linha['manual_movement_id'] !== null
+            ? 'manual:'.$linha['manual_movement_id']
+            : 'settlement:'.$linha['title_settlement_id'];
     }
 
     /**

@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Application\Financial\ConciliacaoItauXlsx;
 use App\Application\Financial\PeriodStatementService;
+use App\Domain\Financial\CompanyGroup;
 use App\Domain\Financial\Money;
 use App\Models\BankAccount;
 use App\Models\Conta;
@@ -11,6 +12,7 @@ use App\Models\PeriodStatement;
 use App\Models\PeriodStatementExclusion;
 use App\Models\PeriodStatementLine;
 use DomainException;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
@@ -75,31 +77,55 @@ class PeriodStatementController extends Controller
 
     public function create(Request $request): View
     {
-        $contas = Conta::query()->orderBy('nome')->get();
+        // Empresas mescladas (ver `CompanyGroup`) aparecem só pelo id
+        // canônico, com o nome de exibição do grupo — os outros membros
+        // (hoje só a Agrocolitti "R") saem do dropdown para não duplicar.
+        $contas = Conta::query()
+            ->whereNotIn('id', CompanyGroup::nonCanonicalMemberIds())
+            ->get()
+            ->each(function (Conta $conta): void {
+                $nome = CompanyGroup::displayName($conta->id);
+                if ($nome !== null) {
+                    $conta->nome = $nome;
+                }
+            })
+            ->sortBy('nome')
+            ->values();
 
         $accountId = (int) $request->input('account_id', $contas->first()->id ?? 0);
         $from = (string) $request->input('from', now()->startOfMonth()->toDateString());
         $to = (string) $request->input('to', now()->endOfMonth()->toDateString());
 
-        // Contas bancárias da empresa escolhida. Sem escolha explícita, cai na
-        // padrão — que é o caso normal e evita obrigar a operadora a repetir
-        // todo mês a mesma resposta.
+        $membrosDoGrupo = CompanyGroup::memberIds($accountId);
+        $ehGrupoMesclado = count($membrosDoGrupo) > 1;
+
+        // Contas bancárias da empresa escolhida — das duas empresas reais
+        // juntas quando é um grupo mesclado, já que a conciliação combinada
+        // existe justamente para mostrar as duas. Sem escolha explícita, cai
+        // na padrão — que é o caso normal e evita obrigar a operadora a
+        // repetir todo mês a mesma resposta.
         $bancos = $accountId > 0
             ? BankAccount::query()
-                ->where('company_id', $accountId)
+                ->whereIn('company_id', $membrosDoGrupo)
                 ->where('active', true)
                 ->orderByDesc('is_default')
                 ->orderBy('bank_name')
                 ->get()
             : collect();
 
-        $bankAccountId = $request->filled('bank_account_id')
-            ? (int) $request->input('bank_account_id')
-            : $bancos->firstWhere('is_default', true)?->id;
+        // Grupo mesclado nunca filtra por um banco só — isso esconderia o
+        // movimento do outro lado, o oposto do que a mesclagem existe para
+        // fazer. `bankAccountId` fica sempre nulo aqui, e a tela não deve
+        // oferecer a escolha de um banco específico quando `$ehGrupoMesclado`.
+        $bankAccountId = $ehGrupoMesclado
+            ? null
+            : ($request->filled('bank_account_id')
+                ? (int) $request->input('bank_account_id')
+                : $bancos->firstWhere('is_default', true)?->id);
 
         // Um id que não pertence à empresa escolhida é descartado em vez de
         // usado: viria de troca de conta com o banco antigo ainda na URL.
-        if ($bankAccountId !== null && ! $bancos->contains('id', $bankAccountId)) {
+        if (! $ehGrupoMesclado && $bankAccountId !== null && ! $bancos->contains('id', $bankAccountId)) {
             $bankAccountId = $bancos->firstWhere('is_default', true)?->id;
         }
 
@@ -130,7 +156,7 @@ class PeriodStatementController extends Controller
 
         return view('period-statements.create', compact(
             'contas', 'conta', 'accountId', 'from', 'to', 'openingCents', 'openingInformado', 'preview', 'semConta',
-            'semBanco', 'bancos', 'banco', 'bankAccountId',
+            'semBanco', 'bancos', 'banco', 'bankAccountId', 'ehGrupoMesclado',
         ));
     }
 
@@ -260,6 +286,12 @@ class PeriodStatementController extends Controller
             ]);
         }
 
+        // Grupo mesclado (ver `CompanyGroup`) nunca abre por um banco só —
+        // um `bank_account_id` vindo de um formulário desatualizado seria
+        // descartado aqui em vez de restringir a conciliação a metade do
+        // grupo.
+        $ehGrupoMesclado = count(CompanyGroup::memberIds((int) $dados['account_id'])) > 1;
+
         try {
             $statement = $this->statements->create(
                 accountId: (int) $dados['account_id'],
@@ -267,7 +299,9 @@ class PeriodStatementController extends Controller
                 to: $dados['to'],
                 openingCents: $openingCents,
                 actorId: $request->user()?->id,
-                bankAccountId: isset($dados['bank_account_id']) ? (int) $dados['bank_account_id'] : null,
+                bankAccountId: $ehGrupoMesclado
+                    ? null
+                    : (isset($dados['bank_account_id']) ? (int) $dados['bank_account_id'] : null),
             );
         } catch (DomainException $e) {
             return back()->withInput()->withErrors($e->getMessage());
@@ -383,6 +417,33 @@ class PeriodStatementController extends Controller
             'Linha removida desta conciliação: %s. O título e a baixa continuam intactos — pode devolver quando quiser.',
             $line->history,
         ));
+    }
+
+    /**
+     * Reordena à mão as linhas de um dia (arrastar e soltar). Responde JSON,
+     * diferente do resto deste controller (`back()`/redirect): quem chama é
+     * `fetch()` do JS de drag-and-drop, não um `<form>` com reload de página.
+     */
+    public function reorderLines(Request $request, PeriodStatement $periodStatement): JsonResponse
+    {
+        $dados = $request->validate([
+            'movement_date' => ['required', 'date_format:Y-m-d'],
+            'line_ids' => ['required', 'array', 'min:1'],
+            'line_ids.*' => ['integer'],
+        ]);
+
+        try {
+            $this->statements->reordenarDia(
+                $periodStatement,
+                $dados['movement_date'],
+                $dados['line_ids'],
+                $request->user()?->id,
+            );
+        } catch (DomainException $e) {
+            return response()->json(['message' => $e->getMessage()], 422);
+        }
+
+        return response()->json(['message' => 'Ordem salva.']);
     }
 
     public function restoreLine(
